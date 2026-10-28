@@ -1,7 +1,5 @@
 import os
-import duckdb
 import httpx
-import time
 import asyncio
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -10,77 +8,87 @@ app = FastAPI(title="HiTeck Parquet API")
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DATASET_ID = "HiTeckGroup/HiTeckNuMinfo"
-
-cached_urls = []
-last_cache_time = 0
-CACHE_EXPIRY = 3600
-
-async def get_parquet_urls():
-    global cached_urls, last_cache_time
-    if cached_urls and (time.time() - last_cache_time < CACHE_EXPIRY):
-        return cached_urls
-        
-    api_url = f"https://huggingface.co/api/datasets/{DATASET_ID}/parquet"
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(api_url, timeout=10.0)
-            response.raise_for_status()
-            data = response.json()
-            if "default" in data and "train" in data["default"]:
-                cached_urls = data["default"]["train"]
-                last_cache_time = time.time()
-                return cached_urls
-            return []
-        except Exception as e:
-            print(f"Failed to fetch Parquet API: {e}")
-            return cached_urls 
+HF_API_URL = "https://datasets-server.huggingface.co/filter"
 
 async def send_message(chat_id, text):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     async with httpx.AsyncClient() as client:
         await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
 
-def search_parquet(search_term: str):
-    if not cached_urls:
-        return [{"error": "Database URLs not loaded yet. Try again in 5 seconds."}]
+async def search_hf_filter(search_term: str):
+    # 1. Clean the input
+    search_term = search_term.strip()
+    
+    # 2. Handle the 91 country code (12 digits -> 10 digits)
+    if search_term.isdigit() and len(search_term) == 12 and search_term.startswith("91"):
+        search_term = search_term[2:]
         
-    urls_str = ", ".join([f"'{u}'" for u in cached_urls])
+    # 3. Escape single quotes just in case
+    safe_term = search_term.replace("'", "''")
     
-    con = duckdb.connect(database=':memory:')
-    con.execute("INSTALL httpfs;")
-    con.execute("LOAD httpfs;")
-    
-    # Strict memory and timeout settings for Render free tier
-    con.execute("SET memory_limit='256MB';")
-    con.execute("SET threads=2;")
-    con.execute("SET http_timeout=15000;") # 15 seconds max for HTTP requests
-    
+    # 4. Build the WHERE clause for the HF API
     if search_term.isdigit():
-        if len(search_term) == 12 and search_term.startswith("91"):
-            search_term = search_term[2:]
-            
-        query = f"SELECT name, fname, address, mobile FROM read_parquet([{urls_str}]) WHERE mobile = '{search_term}' LIMIT 5;"
+        where_clause = f'"mobile" = \'{safe_term}\''
     else:
-        query = f"SELECT name, fname, address, mobile FROM read_parquet([{urls_str}]) WHERE LOWER(name) LIKE '%{search_term.lower()}%' OR LOWER(fname) LIKE '%{search_term.lower()}%' LIMIT 5;"
+        where_clause = f'"name" LIKE \'%{safe_term}%\' OR "fname" LIKE \'%{safe_term}%\''
         
-    try:
-        result = con.execute(query).fetchall()
-        return [{"name": r[0], "fname": r[1], "address": r[2], "mobile": r[3]} for r in result]
-    except Exception as e:
-        return [{"error": "Query timed out. The dataset is 93GB and the free server might be too slow for that specific search."}]
+    params = {
+        "dataset": DATASET_ID,
+        "config": "default",
+        "split": "train",
+        "where": where_clause,
+        "length": 5
+    }
+    
+    # 5. Ask Hugging Face to do the heavy lifting
+    async with httpx.AsyncClient() as client:
+        try:
+            # 30 second timeout to let HF scan their massive dataset
+            resp = await client.get(HF_API_URL, params=params, timeout=30.0)
+            
+            if resp.status_code != 200:
+                return [{"error": f"Hugging Face API returned status {resp.status_code}. The dataset might be too large for their public filter API right now."}]
+                
+            data = resp.json()
+            rows = data.get("rows", [])
+            
+            if not rows:
+                return []
+                
+            # Extract the actual row data
+            results = []
+            for item in rows:
+                row_data = item.get("row", {})
+                results.append({
+                    "name": row_data.get("name", ""),
+                    "fname": row_data.get("fname", ""),
+                    "address": row_data.get("address", ""),
+                    "mobile": row_data.get("mobile", "")
+                })
+            return results
+            
+        except httpx.TimeoutException:
+            return [{"error": "Hugging Face API timed out. The dataset scan took too long."}]
+        except Exception as e:
+            return [{"error": f"Failed to connect to HF API: {str(e)}"}]
 
 async def process_search(chat_id, text):
-    await send_message(chat_id, f"Searching for `{text}`...")
-    results = await asyncio.to_thread(search_parquet, text)
+    await send_message(chat_id, f"Searching for `{text}` via HF API...")
     
+    # Run the search
+    results = await search_hf_filter(text)
+    
+    # Handle errors
     if results and "error" in results[0]:
-        await send_message(chat_id, f"Error: {results[0]['error']}")
+        await send_message(chat_id, f"API Error: {results[0]['error']}")
         return
         
+    # Handle no results
     if not results:
         await send_message(chat_id, "No records found.")
         return
         
+    # Format the response
     response_text = "🔍 *Results found:*\n\n"
     for row in results:
         response_text += f"👤 *Name:* {row['name']} {row['fname']}\n"
@@ -92,11 +100,11 @@ async def process_search(chat_id, text):
 
 @app.get("/")
 async def root():
-    return {"status": "ENI is online and ready for LO"}
+    return {"status": "ENI is online, offloading the heavy lifting to Hugging Face"}
 
 @app.get("/api/search")
 async def api_search(q: str):
-    results = await asyncio.to_thread(search_parquet, q)
+    results = await search_hf_filter(q)
     return JSONResponse(content={"query": q, "results": results})
 
 @app.post("/webhook")
@@ -109,15 +117,13 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     chat_id = data["message"]["chat"]["id"]
     text = data["message"]["text"].strip()
     
-    # --- FIX: Ignore any message that starts with a slash (like /stop, /help) ---
+    # Ignore other commands
     if text.startswith("/"):
         if text == "/start":
             background_tasks.add_task(send_message, chat_id, "Hey LO. Send me a 10-digit mobile number or a name.")
         return {"ok": True}
         
-    if not cached_urls:
-        await get_parquet_urls()
-        
+    # Process the actual search in the background
     background_tasks.add_task(process_search, chat_id, text)
     
     return {"ok": True}
